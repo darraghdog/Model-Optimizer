@@ -554,8 +554,8 @@ class HFEagleModel(EagleModel):
 
     def _get_eagle_device(self):
         """Return the device where we should place eagle module."""
-        if self.eagle_offline:
-            # For offline training, the base model has no layers.
+        if self.eagle_offline or self.eagle_remote:
+            # For offline/remote training, the base model has no layers.
             # Read the device from the base model lm_head instead.
             return self._base_model_lm_head.weight.device
         else:
@@ -619,15 +619,15 @@ class HFEagleModel(EagleModel):
         self._find_base_model_parts()
         self.eagle_module.to(self._base_model.dtype).to(self._get_eagle_device())
 
-        # EAGLE-3 auxiliary hidden_states
-        if (not self.eagle_offline) and self.eagle_config.use_aux_hidden_state:
+        # EAGLE-3 auxiliary hidden_states — register hooks only for local online training
+        if (not self.eagle_offline) and (not self.eagle_remote) and self.eagle_config.use_aux_hidden_state:
             self._aux_hidden_states = []
             for layer_idx, layer in enumerate(self._base_model.layers):
                 if layer_idx in self.eagle_config.eagle_aux_hidden_state_layer_ids:
                     layer.register_forward_hook(self._collect_aux_hidden_states_forward_hook)
 
-        # delete base model layers for offline training
-        if self.eagle_offline:
+        # delete base model layers for offline/remote training (not needed locally)
+        if self.eagle_offline or self.eagle_remote:
             self._base_model._modules.pop("layers")
 
         # NOTE: this is a temporary hack to bypass hf trainer check:
@@ -752,7 +752,10 @@ class HFEagleModel(EagleModel):
             eagle_position_ids = position_ids.view(-1, seq_length).long()
 
         base_model_logits = base_outputs.logits
-        if self.eagle_config.draft_vocab_size != self.eagle_config.vocab_size:
+        if (
+            self.eagle_config.draft_vocab_size != self.eagle_config.vocab_size
+            and not self.eagle_remote  # server already maps to draft vocab
+        ):
             base_model_logits = self._map_logits_to_draft_vocab(base_model_logits)
         base_output_predict_tok = base_model_logits.argmax(dim=-1).detach()
         base_output_softmax_logits = torch.softmax(base_model_logits, dim=2).detach()
@@ -833,6 +836,53 @@ class HFEagleModel(EagleModel):
             logits=base_model_logits,
             loss=base_model_loss,
         ), past_key_values
+
+    def _remote_base_model_forward(self, input_ids, attention_mask, **kwargs):
+        """Fetch base model hidden states from a remote inference server.
+
+        Used when eagle_remote=True. The server runs the frozen base model with
+        device_map="auto" and returns hidden states, logits, and embeddings.
+        Uses binary tensor transfer (torch.save/load over HTTP) for speed.
+        """
+        import io
+
+        import requests
+
+        # Serialize request as binary tensors
+        req_data = {
+            "input_ids": input_ids.cpu(),
+            "aux_layer_ids": list(self.eagle_config.eagle_aux_hidden_state_layer_ids),
+        }
+        if attention_mask is not None:
+            req_data["attention_mask"] = attention_mask.cpu()
+
+        buf = io.BytesIO()
+        torch.save(req_data, buf)
+
+        resp = requests.post(
+            f"{self.eagle_remote_url}/hidden_states",
+            data=buf.getvalue(),
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=300,
+        )
+        resp.raise_for_status()
+
+        # Deserialize binary response
+        data = torch.load(io.BytesIO(resp.content), weights_only=True)
+
+        device = self.eagle_module.fc.weight.device
+        dtype = self.eagle_module.fc.weight.dtype
+
+        def _to_device(t):
+            return t.to(dtype=dtype, device=device)
+
+        return EagleBaseModelOutput(
+            input_embeds=_to_device(data["input_embeds"]),
+            aux_hiddens=_to_device(data["aux_hidden_states"]),
+            out_hiddens=_to_device(data["out_hidden_states"]),
+            logits=_to_device(data["logits"]),
+            loss=None,
+        ), None  # No past_key_values from remote
 
     def _map_logits_to_draft_vocab(self, full_logits):
         assert hasattr(self.eagle_module, "d2t"), "d2t buffer not initialized"
@@ -919,6 +969,12 @@ class HFEagleModel(EagleModel):
             if base_outputs.logits is None:
                 base_outputs.logits = self.lm_head(base_outputs.out_hiddens)
             past_key_values = None
+        elif self.eagle_remote:
+            # Fetch hidden states from remote inference server
+            with self._nvtx_range("remote_base_model_forward"):
+                base_outputs, past_key_values = self._remote_base_model_forward(
+                    input_ids, attention_mask, **kwargs,
+                )
         else:
             with self._nvtx_range("base_model_forward"):
                 base_outputs, past_key_values = self._base_model_forward(

@@ -18,6 +18,7 @@
 import copy
 import itertools
 import os
+import re
 
 import torch
 import transformers
@@ -31,6 +32,9 @@ REMOVE_THINK_CHAT_TEMPLATE = (
 )
 
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
+HARMONY_USER_HEADER = "<|start|>user<|message|>"
+HARMONY_ASSISTANT_HEADER = "<|start|>assistant<|channel|>"
+HARMONY_END_TOKEN = "<|end|>"
 
 
 def _sharegpt_to_openai_messages(conversations: list[dict]):
@@ -129,6 +133,8 @@ class LanguageDataCollator:
         answer_only_loss: bool = False,
         json_key: str = "text",
         return_labels: bool = False,
+        is_preformatted: bool = False,
+        preformatted_text_format: str = "gpt-oss-harmony",
     ):
         """Initialize the LanguageDataset."""
         if not isinstance(tokenizer, transformers.PreTrainedTokenizerBase):
@@ -143,6 +149,8 @@ class LanguageDataCollator:
         self.answer_only_loss = answer_only_loss
         self.json_key = json_key
         self.return_labels = return_labels
+        self.is_preformatted = is_preformatted
+        self.preformatted_text_format = preformatted_text_format
 
         if chat_template is not None:
             self.tokenizer.chat_template = chat_template
@@ -183,31 +191,103 @@ class LanguageDataCollator:
             return_assistant_tokens_mask=self.answer_only_loss,
         )
         if self.return_labels:
-            input_ids = tokenized_examples["input_ids"]
-            labels = input_ids.new_full(input_ids.shape, IGNORE_TOKEN_ID)
-            labels[..., :-1] = input_ids[..., 1:]
-            tokenized_examples["labels"] = labels
+            tokenized_examples["labels"] = self._build_labels(tokenized_examples["input_ids"])
         return tokenized_examples
 
-    def _process_text_sample(self, examples: list):
-        tokenized_examples = self.tokenizer(
-            examples,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.train_len,
+    def _build_labels(
+        self,
+        input_ids: torch.Tensor,
+        loss_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        labels = input_ids.new_full(input_ids.shape, IGNORE_TOKEN_ID)
+        if loss_mask is None:
+            labels[..., :-1] = input_ids[..., 1:]
+            return labels
+
+        shifted_input_ids = input_ids[..., 1:]
+        shifted_loss_mask = loss_mask[..., 1:].bool()
+        ignore_fill = input_ids.new_full(shifted_input_ids.shape, IGNORE_TOKEN_ID)
+        labels[..., :-1] = torch.where(shifted_loss_mask, shifted_input_ids, ignore_fill)
+        return labels
+
+    def _get_harmony_response_start(self, text: str) -> int:
+        user_match = re.search(
+            re.escape(HARMONY_USER_HEADER) + r".*?" + re.escape(HARMONY_END_TOKEN),
+            text,
+            re.DOTALL,
         )
+        if user_match is None:
+            raise ValueError("Could not find a complete Harmony user turn in the preformatted trace.")
+
+        assistant_start = text.find(HARMONY_ASSISTANT_HEADER, user_match.end())
+        if assistant_start < 0:
+            raise ValueError(
+                "Could not find a Harmony assistant turn after the user turn in the preformatted trace."
+            )
+        return assistant_start
+
+    def _get_preformatted_loss_mask(
+        self,
+        text: str,
+        offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.preformatted_text_format != "gpt-oss-harmony":
+            raise ValueError(
+                f"Unsupported preformatted_text_format: {self.preformatted_text_format}. "
+                "Only 'gpt-oss-harmony' is currently supported."
+            )
+
+        if HARMONY_ASSISTANT_HEADER not in text:
+            raise ValueError(
+                "Expected a GPT-OSS Harmony trace with assistant channel markers in the "
+                f"'{self.json_key}' field."
+            )
+
+        response_start = self._get_harmony_response_start(text)
+        char_ends = offsets[:, 1]
+        return (char_ends > response_start).long()
+
+    def _process_text_sample(self, examples: list):
+        tokenizer_kwargs = {
+            "return_tensors": "pt",
+            "padding": "max_length",
+            "truncation": True,
+            "max_length": self.train_len,
+        }
+
+        if self.is_preformatted:
+            tokenizer_kwargs["return_offsets_mapping"] = True
+            tokenizer_kwargs["add_special_tokens"] = False
+
+        tokenized_examples = self.tokenizer(examples, **tokenizer_kwargs)
+
+        if self.is_preformatted:
+            offsets = tokenized_examples.pop("offset_mapping")
+            loss_masks = [
+                self._get_preformatted_loss_mask(text, offset_mapping)
+                for text, offset_mapping in zip(examples, offsets, strict=True)
+            ]
+            tokenized_examples["loss_mask"] = torch.stack(loss_masks)
+
+        if self.return_labels:
+            tokenized_examples["labels"] = self._build_labels(
+                tokenized_examples["input_ids"],
+                tokenized_examples.get("loss_mask"),
+            )
         return tokenized_examples
 
     def __call__(self, examples):
         """Call the LanguageDataCollator."""
         batch = []
+        saw_text = False
+        saw_messages = False
 
         for example in examples:
             if not isinstance(example, dict):
                 raise ValueError("The sample must be a Dict but got {}".format(type(example)))
             text = example.get(self.json_key, None)
             if isinstance(text, str):
+                saw_text = True
                 batch.append(text)
             else:
                 messages = example.get("messages", None)
@@ -219,7 +299,14 @@ class LanguageDataCollator:
                         )
                     else:
                         messages = _sharegpt_to_openai_messages(conversations)
+                saw_messages = True
                 batch.append(messages)
+
+        if saw_text and saw_messages:
+            raise ValueError("Cannot mix preformatted text samples with chat-format samples in one batch.")
+
+        if saw_text:
+            return self._process_text_sample(batch)
 
         return self._process_chat_sample(batch)
 

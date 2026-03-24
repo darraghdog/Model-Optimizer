@@ -140,6 +140,8 @@ def make_eagle_supervised_data_module(
                 tokenizer=tokenizer,
                 train_len=train_len,
                 return_labels=True,
+                is_preformatted=getattr(data_args, "is_preformatted", False),
+                preformatted_text_format=getattr(data_args, "preformatted_text_format", "gpt-oss-harmony"),
             )
         else:
             data_collator = VisionLanguageDataCollator(
