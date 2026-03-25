@@ -120,3 +120,13 @@ class EagleConfig(ModeloptBaseConfig):
         default=False,
         description="Whether to enable NVTX ranges for profiling eagle forward/loss methods.",
     )
+
+    eagle_remote: bool = ModeloptField(
+        default=False,
+        description="Whether to fetch base model hidden states from a remote server instead of local forward.",
+    )
+
+    eagle_remote_url: str = ModeloptField(
+        default="",
+        description="URL of the hidden state server (e.g. http://localhost:8000) when eagle_remote=True.",
+    )

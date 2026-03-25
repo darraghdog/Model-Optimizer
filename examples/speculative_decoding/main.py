@@ -79,6 +79,24 @@ class DataArguments:
         },
     )
     lazy_preprocess: bool = True
+    is_preformatted: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether the training dataset stores ready-to-tokenize trace text in a "
+                "'text' column instead of raw conversations."
+            )
+        },
+    )
+    preformatted_text_format: str = field(
+        default="gpt-oss-harmony",
+        metadata={
+            "help": (
+                "Format of preformatted traces when --is_preformatted is enabled. "
+                "Currently only GPT-OSS Harmony traces are supported."
+            )
+        },
+    )
     draft_vocab_cache: str | None = field(
         default=None,
         metadata={"help": "Path to d2t.pt cache file."},
@@ -138,6 +156,14 @@ class EagleArguments:
         default=3,
         metadata={"help": "Number of train-time-test steps to use during training."},
     )
+    eagle_remote: bool = field(
+        default=False,
+        metadata={"help": "Fetch base model hidden states from a remote server instead of local forward."},
+    )
+    eagle_remote_url: str = field(
+        default="",
+        metadata={"help": "URL of hidden state server (e.g. http://localhost:8000)."},
+    )
 
 
 def train():
@@ -185,7 +211,8 @@ def train():
     else:
         # To avoid OOM for large models, we load and convert model on CPU first.
         # Model will be moved to GPU during HF trainer.init().
-        offline_kwargs = {"num_hidden_layers": 0} if use_offline_training else {}
+        use_remote = eagle_args.eagle_remote if training_args.mode == "eagle3" else False
+        offline_kwargs = {"num_hidden_layers": 0} if (use_offline_training or use_remote) else {}
         model_config, model = load_vlm_or_llm_with_kwargs(
             model_args.model_name_or_path,
             torch_dtype="auto",
@@ -193,8 +220,8 @@ def train():
             trust_remote_code=True,
             **offline_kwargs,
         )
-        if use_offline_training:
-            # When doing offline training, we need to set num_hidden_layers
+        if use_offline_training or use_remote:
+            # When doing offline/remote training, we need to set num_hidden_layers
             # since we override it when loading the model for space savings
             model.config.num_orig_hidden_layers = model_config.num_hidden_layers
         tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -220,17 +247,23 @@ def train():
                 "eagle_use_torch_compile": not eagle_args.disable_torch_compile,
                 "eagle_ttt_steps": eagle_args.num_ttt_steps,
                 "eagle_architecture_config": custom_config,
+                "eagle_remote": eagle_args.eagle_remote,
+                "eagle_remote_url": eagle_args.eagle_remote_url,
             }
 
             mtsp.convert(model, [("eagle", config)])
 
-            # read draft vocab cache
-            if model.eagle_config.draft_vocab_size < model.eagle_config.vocab_size:
+            # read draft vocab cache (not needed for remote — server handles mapping)
+            if (
+                model.eagle_config.draft_vocab_size < model.eagle_config.vocab_size
+                and not eagle_args.eagle_remote
+            ):
                 if not os.path.isfile(data_args.draft_vocab_cache):
                     raise FileNotFoundError(
                         f"Draft vocab cache provided but not found: {data_args.draft_vocab_cache}"
                     )
-                model.eagle_module.d2t = torch.load(data_args.draft_vocab_cache)
+                cache = torch.load(data_args.draft_vocab_cache)
+                model.eagle_module.d2t = cache["d2t"] if isinstance(cache, dict) else cache
                 print_rank_0(f"Loaded draft vocab cache from {data_args.draft_vocab_cache}.")
         else:
             raise Exception(f"{training_args.mode} is not supported!")

@@ -41,3 +41,5 @@ class EagleModel(DynamicModule):
         self.eagle_mix_hidden_states = config.eagle_mix_hidden_states
         self.eagle_use_torch_compile = config.eagle_use_torch_compile
         self.eagle_enable_nvtx = config.eagle_enable_nvtx
+        self.eagle_remote = config.eagle_remote
+        self.eagle_remote_url = config.eagle_remote_url
