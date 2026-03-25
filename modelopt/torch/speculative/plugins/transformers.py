@@ -593,6 +593,14 @@ class HFEagleModel(EagleModel):
         if self.eagle_config._attn_implementation is None:
             self.eagle_config._attn_implementation = "sdpa"
 
+        # Override from eagle architecture config (PretrainedConfig ignores _-prefixed keys)
+        arch_cfg = config.eagle_architecture_config
+        if "_attn_implementation" in arch_cfg:
+            self.eagle_config._attn_implementation = arch_cfg["_attn_implementation"]
+        # Disable sliding window for EAGLE head (base model may have per-layer sliding window)
+        if "sliding_window" in arch_cfg:
+            self.eagle_config.sliding_window = arch_cfg["sliding_window"]
+
         # Patch for Kimi-K2-Thinking, avoid quantizing drafter
         quant_config = getattr(self.config, "quantization_config", None)
         if isinstance(quant_config, CompressedTensorsConfig):
@@ -614,6 +622,19 @@ class HFEagleModel(EagleModel):
             self.eagle_config,
             decoder_cls,
         )
+
+        # Force sliding_window=None and attention_dropout=0 on EAGLE head's attention
+        # layers. The base model may have per-layer sliding window that leaks via config.
+        # Also ensure dropout=0 so SDPA can use the flash attention kernel.
+        for layer in self.eagle_module.layers:
+            if hasattr(layer, "self_attn"):
+                attn = layer.self_attn
+                attn.sliding_window = None
+                attn.attention_dropout = 0.0
+                # Also patch the config object the layer reads from
+                if hasattr(attn, "config"):
+                    attn.config.sliding_window = None
+                    attn.config.attention_dropout = 0.0
 
         # find base model, lm head, and embeddings paths
         self._find_base_model_parts()
@@ -721,20 +742,25 @@ class HFEagleModel(EagleModel):
             eagle_input_hiddens = base_outputs.out_hiddens
 
         # Prepare attention_mask
-        if attention_mask is None:
-            eagle_attention_mask = torch.ones(  # default: all tokens are valid
-                (b, seq_len_with_past), dtype=torch.bool, device=eagle_input_hiddens.device
-            )
+        if self.eagle_mix_hidden_states:
+            # mix_hidden_states: pass None to let SDPA use is_causal=True
+            # (avoids materializing O(n²) causal mask + sliding_window issues)
+            eagle_attention_mask = None
         else:
-            eagle_attention_mask = attention_mask.roll(-1, 1)  # Shift left 1 token
-        # Expand the 2-D attention mask to 4-D and apply causal mask.
-        eagle_attention_mask = self._prepare_decoder_attention_mask(
-            eagle_attention_mask,
-            (b, seq_length),
-            past_kv_len,
-            eagle_input_hiddens.device,
-            eagle_input_hiddens.dtype,
-        )
+            if attention_mask is None:
+                eagle_attention_mask = torch.ones(  # default: all tokens are valid
+                    (b, seq_len_with_past), dtype=torch.bool, device=eagle_input_hiddens.device
+                )
+            else:
+                eagle_attention_mask = attention_mask.roll(-1, 1)  # Shift left 1 token
+            # Expand the 2-D attention mask to 4-D and apply causal mask.
+            eagle_attention_mask = self._prepare_decoder_attention_mask(
+                eagle_attention_mask,
+                (b, seq_length),
+                past_kv_len,
+                eagle_input_hiddens.device,
+                eagle_input_hiddens.dtype,
+            )
 
         # Prepare position_ids
         if position_ids is None:
@@ -849,6 +875,7 @@ class HFEagleModel(EagleModel):
         import requests
 
         # Serialize request as binary tensors
+        print(f"[REMOTE FWD] input_ids={input_ids.shape}", flush=True)
         req_data = {
             "input_ids": input_ids.cpu(),
             "aux_layer_ids": list(self.eagle_config.eagle_aux_hidden_state_layer_ids),
@@ -1020,11 +1047,15 @@ class HFEagleModel(EagleModel):
         # ====Run eagle forward with extra training-time-test steps====
         for ttt_step in range(self.eagle_ttt_steps):
             # TODO: (hg) during cp training, this mask is not used. Maybe turn it off then.
-            eagle_attention_mask = (
-                eagle_attn_mask_0
-                if self.eagle_mix_hidden_states or ttt_step == 0
-                else self._get_ttt_attention_mask(b, seq_length, ttt_step)
-            )
+            if self.eagle_mix_hidden_states:
+                # mix_hidden_states uses pure causal mask — pass None to let SDPA
+                # use is_causal=True (avoids sliding_window enforcement + uses
+                # memory-efficient flash kernel instead of materializing O(n²) mask)
+                eagle_attention_mask = None
+            elif ttt_step == 0:
+                eagle_attention_mask = eagle_attn_mask_0
+            else:
+                eagle_attention_mask = self._get_ttt_attention_mask(b, seq_length, ttt_step)
             with self._enable_cp_ttt(), self._nvtx_range("eagle_forward"):
                 _, eagle_output_hiddens, eagle_logits, eagle_cache = self._eagle_forward(
                     eagle_input_hiddens,

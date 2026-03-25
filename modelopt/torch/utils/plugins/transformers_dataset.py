@@ -201,14 +201,15 @@ class LanguageDataCollator:
 
     def __call__(self, examples):
         """Call the LanguageDataCollator."""
-        batch = []
+        texts = []
+        chats = []
 
         for example in examples:
             if not isinstance(example, dict):
                 raise ValueError("The sample must be a Dict but got {}".format(type(example)))
             text = example.get(self.json_key, None)
             if isinstance(text, str):
-                batch.append(text)
+                texts.append(text)
             else:
                 messages = example.get("messages", None)
                 if messages is None:
@@ -219,9 +220,13 @@ class LanguageDataCollator:
                         )
                     else:
                         messages = _sharegpt_to_openai_messages(conversations)
-                batch.append(messages)
+                chats.append(messages)
 
-        return self._process_chat_sample(batch)
+        # Use tokenizer() for raw text (returns proper [B, seq] batch)
+        # Use apply_chat_template() for chat messages
+        if texts:
+            return self._process_text_sample(texts)
+        return self._process_chat_sample(chats)
 
 
 class VisionLanguageDataCollator(LanguageDataCollator):

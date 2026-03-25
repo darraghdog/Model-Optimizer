@@ -18,4 +18,7 @@
 import warnings as _warnings
 from importlib.metadata import version as _version
 
-__version__ = _version("nvidia-modelopt")
+try:
+    __version__ = _version("nvidia-modelopt")
+except Exception:
+    __version__ = "0.0.0.dev0"
