@@ -871,6 +871,7 @@ class HFEagleModel(EagleModel):
         Each rank gets 1 sample — BS=1 per GPU, no OOM.
         """
         import io
+        import os
 
         import requests
         import torch.distributed as dist
@@ -885,43 +886,62 @@ class HFEagleModel(EagleModel):
         world_size = dist.get_world_size() if use_ddp else 1
 
         if use_ddp:
+            # Use node-local group so each node's rank 0 gathers from its own 8 ranks
+            # and calls its LOCAL server (each node has its own vLLM instance)
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
+            node_id = rank // local_world_size
+            node_ranks = list(range(node_id * local_world_size, (node_id + 1) * local_world_size))
+            coordinator = node_ranks[0]  # global rank of this node's coordinator
+            is_coordinator = (rank == coordinator)
+
+            if not hasattr(self, "_node_group"):
+                # Create node-local groups — new_group is collective, all ranks must call it
+                # for each group. Create one group per node.
+                num_nodes = world_size // local_world_size
+                for n in range(num_nodes):
+                    ranks_n = list(range(n * local_world_size, (n + 1) * local_world_size))
+                    grp = dist.new_group(ranks=ranks_n)
+                    if n == node_id:
+                        self._node_group = grp
+
             # Free training activations before vLLM uses the GPU for extraction
             torch.cuda.empty_cache()
 
             t0 = _time.time()
-            gathered_ids = [torch.zeros_like(input_ids) for _ in range(world_size)] if rank == 0 else None
-            dist.gather(input_ids.contiguous(), gather_list=gathered_ids, dst=0)
+            gathered_ids = [torch.zeros_like(input_ids) for _ in range(local_world_size)] if is_coordinator else None
+            dist.gather(input_ids.contiguous(), gather_list=gathered_ids, dst=coordinator, group=self._node_group)
             t_gather = _time.time() - t0
 
-            if rank == 0:
+            if is_coordinator:
                 t0 = _time.time()
                 batched_ids = torch.cat(gathered_ids, dim=0)
                 data = self._http_request(batched_ids, attention_mask)
                 t_http = _time.time() - t0
-                print(f"[RANK0] gather={t_gather:.1f}s http={t_http:.1f}s ids={batched_ids.shape}", flush=True)
+                print(f"[RANK{rank}] gather={t_gather:.1f}s http={t_http:.1f}s ids={batched_ids.shape}", flush=True)
             else:
                 data = None
 
-            # Scatter results from rank 0 to all ranks (on GPU — NCCL needs GPU tensors)
+            # Scatter results from coordinator to node-local ranks
             t0 = _time.time()
             result = {}
             for key in ["input_embeds", "aux_hidden_states", "out_hidden_states", "logits"]:
-                if rank == 0:
+                if is_coordinator:
                     last_dim = torch.tensor(data[key].shape[-1], device=device)
                 else:
                     last_dim = torch.tensor(0, device=device)
-                dist.broadcast(last_dim, src=0)
+                dist.broadcast(last_dim, src=coordinator, group=self._node_group)
 
                 local = torch.zeros(1, input_ids.shape[1], last_dim.item(), dtype=dtype, device=device)
-                if rank == 0:
-                    chunks = [c.to(dtype=dtype, device=device) for c in data[key].chunk(world_size, dim=0)]
+                if is_coordinator:
+                    chunks = [c.to(dtype=dtype, device=device) for c in data[key].chunk(local_world_size, dim=0)]
                 else:
                     chunks = None
-                dist.scatter(local, scatter_list=chunks, src=0)
+                dist.scatter(local, scatter_list=chunks, src=coordinator, group=self._node_group)
                 result[key] = local
             t_scatter = _time.time() - t0
-            if rank == 0:
-                print(f"[RANK0] scatter={t_scatter:.1f}s", flush=True)
+            if is_coordinator:
+                print(f"[RANK{rank}] scatter={t_scatter:.1f}s", flush=True)
         else:
             # Single rank: send directly
             data = self._http_request(input_ids, attention_mask)
@@ -938,17 +958,47 @@ class HFEagleModel(EagleModel):
             loss=None,
         ), None
 
+    @staticmethod
+    def _load_raw_tensors(path):
+        """Load tensors from raw binary file: [4B header_len][JSON header][tensor data]."""
+        import json
+        import struct
+
+        import numpy as np
+
+        TORCH_TO_NP = {
+            "torch.bfloat16": (np.int16, torch.bfloat16),
+            "torch.float16": (np.float16, torch.float16),
+            "torch.float32": (np.float32, torch.float32),
+            "torch.int64": (np.int64, torch.int64),
+            "torch.int32": (np.int32, torch.int32),
+        }
+        with open(path, "rb") as f:
+            header_len = struct.unpack("!I", f.read(4))[0]
+            header = json.loads(f.read(header_len))
+            result = {}
+            for entry in header:
+                np_dtype, torch_dtype = TORCH_TO_NP[entry["dtype"]]
+                count = 1
+                for s in entry["shape"]:
+                    count *= s
+                arr = np.fromfile(f, dtype=np_dtype, count=count)
+                t = torch.from_numpy(arr).reshape(entry["shape"])
+                if entry["dtype"] == "torch.bfloat16":
+                    t = t.view(torch.bfloat16)
+                result[entry["name"]] = t
+        return result
+
     def _http_request(self, input_ids, attention_mask=None):
         """Send input_ids to hidden state server, return dict of tensors.
 
         Server writes tensors to /dev/shm (RAM-backed tmpfs) and returns the path.
-        Client loads via safetensors mmap (near zero-copy), then deletes the file.
+        Client loads via mmap (near zero-copy), then deletes the file.
         """
         import io
         import os
 
         import requests
-        from safetensors.torch import load_file as st_load_file
 
         req_data = {
             "input_ids": input_ids.cpu(),
@@ -968,8 +1018,8 @@ class HFEagleModel(EagleModel):
         )
         resp.raise_for_status()
         shm_path = resp.content.decode()
-        result = st_load_file(shm_path)
-        os.unlink(shm_path)
+        result = self._load_raw_tensors(shm_path)
+        # Don't unlink — server reuses the same file to keep pages resident
         return result
 
     def _map_logits_to_draft_vocab(self, full_logits):
