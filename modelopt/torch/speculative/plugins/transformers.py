@@ -939,11 +939,16 @@ class HFEagleModel(EagleModel):
         ), None
 
     def _http_request(self, input_ids, attention_mask=None):
-        """Send input_ids to hidden state server, return dict of tensors."""
+        """Send input_ids to hidden state server, return dict of tensors.
+
+        Server writes tensors to /dev/shm (RAM-backed tmpfs) and returns the path.
+        Client loads via safetensors mmap (near zero-copy), then deletes the file.
+        """
         import io
+        import os
 
         import requests
-        from safetensors.torch import load as st_load
+        from safetensors.torch import load_file as st_load_file
 
         req_data = {
             "input_ids": input_ids.cpu(),
@@ -962,7 +967,10 @@ class HFEagleModel(EagleModel):
             timeout=600,
         )
         resp.raise_for_status()
-        return st_load(resp.content)
+        shm_path = resp.content.decode()
+        result = st_load_file(shm_path)
+        os.unlink(shm_path)
+        return result
 
     def _map_logits_to_draft_vocab(self, full_logits):
         assert hasattr(self.eagle_module, "d2t"), "d2t buffer not initialized"
