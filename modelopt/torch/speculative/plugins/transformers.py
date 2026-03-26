@@ -943,6 +943,7 @@ class HFEagleModel(EagleModel):
         import io
 
         import requests
+        from safetensors.torch import load as st_load
 
         req_data = {
             "input_ids": input_ids.cpu(),
@@ -961,7 +962,7 @@ class HFEagleModel(EagleModel):
             timeout=600,
         )
         resp.raise_for_status()
-        return torch.load(io.BytesIO(resp.content), weights_only=True)
+        return st_load(resp.content)
 
     def _map_logits_to_draft_vocab(self, full_logits):
         assert hasattr(self.eagle_module, "d2t"), "d2t buffer not initialized"
