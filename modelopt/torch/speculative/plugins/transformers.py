@@ -864,18 +864,86 @@ class HFEagleModel(EagleModel):
         ), past_key_values
 
     def _remote_base_model_forward(self, input_ids, attention_mask, **kwargs):
-        """Fetch base model hidden states from a remote inference server.
+        """Fetch base model hidden states from remote server.
 
-        Used when eagle_remote=True. The server runs the frozen base model with
-        device_map="auto" and returns hidden states, logits, and embeddings.
-        Uses binary tensor transfer (torch.save/load over HTTP) for speed.
+        With DDP (nproc_per_node=8): rank 0 gathers input_ids from all ranks,
+        sends one batched request to the server, scatters results back.
+        Each rank gets 1 sample — BS=1 per GPU, no OOM.
         """
         import io
 
         import requests
+        import torch.distributed as dist
 
-        # Serialize request as binary tensors
-        print(f"[REMOTE FWD] input_ids={input_ids.shape}", flush=True)
+        device = self.eagle_module.fc.weight.device
+        dtype = self.eagle_module.fc.weight.dtype
+
+        import time as _time
+
+        use_ddp = dist.is_initialized() and dist.get_world_size() > 1
+        rank = dist.get_rank() if use_ddp else 0
+        world_size = dist.get_world_size() if use_ddp else 1
+
+        if use_ddp:
+            # Free training activations before vLLM uses the GPU for extraction
+            torch.cuda.empty_cache()
+
+            t0 = _time.time()
+            gathered_ids = [torch.zeros_like(input_ids) for _ in range(world_size)] if rank == 0 else None
+            dist.gather(input_ids.contiguous(), gather_list=gathered_ids, dst=0)
+            t_gather = _time.time() - t0
+
+            if rank == 0:
+                t0 = _time.time()
+                batched_ids = torch.cat(gathered_ids, dim=0)
+                data = self._http_request(batched_ids, attention_mask)
+                t_http = _time.time() - t0
+                print(f"[RANK0] gather={t_gather:.1f}s http={t_http:.1f}s ids={batched_ids.shape}", flush=True)
+            else:
+                data = None
+
+            # Scatter results from rank 0 to all ranks (on GPU — NCCL needs GPU tensors)
+            t0 = _time.time()
+            result = {}
+            for key in ["input_embeds", "aux_hidden_states", "out_hidden_states", "logits"]:
+                if rank == 0:
+                    last_dim = torch.tensor(data[key].shape[-1], device=device)
+                else:
+                    last_dim = torch.tensor(0, device=device)
+                dist.broadcast(last_dim, src=0)
+
+                local = torch.zeros(1, input_ids.shape[1], last_dim.item(), dtype=dtype, device=device)
+                if rank == 0:
+                    chunks = [c.to(dtype=dtype, device=device) for c in data[key].chunk(world_size, dim=0)]
+                else:
+                    chunks = None
+                dist.scatter(local, scatter_list=chunks, src=0)
+                result[key] = local
+            t_scatter = _time.time() - t0
+            if rank == 0:
+                print(f"[RANK0] scatter={t_scatter:.1f}s", flush=True)
+        else:
+            # Single rank: send directly
+            data = self._http_request(input_ids, attention_mask)
+            result = data
+
+        def _to_device(t):
+            return t.to(dtype=dtype, device=device)
+
+        return EagleBaseModelOutput(
+            input_embeds=_to_device(result["input_embeds"]),
+            aux_hiddens=_to_device(result["aux_hidden_states"]),
+            out_hiddens=_to_device(result["out_hidden_states"]),
+            logits=_to_device(result["logits"]),
+            loss=None,
+        ), None
+
+    def _http_request(self, input_ids, attention_mask=None):
+        """Send input_ids to hidden state server, return dict of tensors."""
+        import io
+
+        import requests
+
         req_data = {
             "input_ids": input_ids.cpu(),
             "aux_layer_ids": list(self.eagle_config.eagle_aux_hidden_state_layer_ids),
@@ -890,26 +958,10 @@ class HFEagleModel(EagleModel):
             f"{self.eagle_remote_url}/hidden_states",
             data=buf.getvalue(),
             headers={"Content-Type": "application/octet-stream"},
-            timeout=300,
+            timeout=600,
         )
         resp.raise_for_status()
-
-        # Deserialize binary response
-        data = torch.load(io.BytesIO(resp.content), weights_only=True)
-
-        device = self.eagle_module.fc.weight.device
-        dtype = self.eagle_module.fc.weight.dtype
-
-        def _to_device(t):
-            return t.to(dtype=dtype, device=device)
-
-        return EagleBaseModelOutput(
-            input_embeds=_to_device(data["input_embeds"]),
-            aux_hiddens=_to_device(data["aux_hidden_states"]),
-            out_hiddens=_to_device(data["out_hidden_states"]),
-            logits=_to_device(data["logits"]),
-            loss=None,
-        ), None  # No past_key_values from remote
+        return torch.load(io.BytesIO(resp.content), weights_only=True)
 
     def _map_logits_to_draft_vocab(self, full_logits):
         assert hasattr(self.eagle_module, "d2t"), "d2t buffer not initialized"
