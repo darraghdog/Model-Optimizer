@@ -47,6 +47,17 @@ from transformers.trainer_utils import get_last_checkpoint
 
 import modelopt.torch.opt as mto
 import modelopt.torch.speculative as mtsp
+
+# Monkey-patch: transformers 5.0rc1 revert_weight_conversion crashes for puzzle model
+# (weight conversion ops don't implement reverse_op). Safe to skip — we only save the
+# EAGLE head weights, not the base model. Must patch in modeling_utils where it's
+# already imported, not just in core_model_loading.
+try:
+    import transformers.modeling_utils
+
+    transformers.modeling_utils.revert_weight_conversion = lambda model, state_dict: state_dict
+except (ImportError, AttributeError):
+    pass
 from modelopt.torch.speculative.utils import (
     load_vlm_or_llm_with_kwargs,
     patch_transformers5_params_loading,
@@ -202,7 +213,10 @@ def train():
 
     use_offline_training = data_args.offline_data_path is not None
 
-    if checkpoint:
+    # Always load base model from original path and apply EAGLE conversion.
+    # When resuming, trainer.train(resume_from_checkpoint) restores weights + optimizer.
+    # Loading from checkpoint dir fails for models with custom dynamic modules (puzzle).
+    if False:  # Old resume path — disabled, kept for reference
         with patch_transformers5_params_loading():
             _, model = load_vlm_or_llm_with_kwargs(
                 checkpoint, torch_dtype="auto", trust_remote_code=True
